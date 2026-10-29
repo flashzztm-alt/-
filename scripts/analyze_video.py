@@ -13,9 +13,13 @@ content -- that happens afterwards, by feeding this JSON to an LLM.
 """
 import argparse
 import json
+import subprocess
 import sys
 import tempfile
+import wave
 from pathlib import Path
+
+import numpy as np
 
 
 def fetch_and_download(
@@ -72,11 +76,33 @@ def fetch_and_download(
     return metadata, audio_files[0]
 
 
-def transcribe(audio_path: Path, model_size: str, language: str | None) -> dict:
+def decode_to_mono16k(audio_path: Path, workdir: Path) -> np.ndarray:
+    """Convert any audio file to 16kHz mono PCM via ffmpeg and load as float32.
+
+    Used instead of handing faster-whisper a file path, because its
+    internal PyAV-based decoder (faster_whisper.audio.decode_audio) is not
+    compatible with every installed PyAV version (av.open()'s accepted
+    keyword arguments have changed across releases).
+    """
+    wav_path = workdir / "audio_16k_mono.wav"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(audio_path), "-ar", "16000", "-ac", "1", "-f", "wav", str(wav_path)],
+        check=True,
+        capture_output=True,
+    )
+    with wave.open(str(wav_path), "rb") as wf:
+        raw = wf.readframes(wf.getnframes())
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    return samples
+
+
+def transcribe(audio_path: Path, workdir: Path, model_size: str, language: str | None) -> dict:
     from faster_whisper import WhisperModel
 
+    audio_array = decode_to_mono16k(audio_path, workdir)
+
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    segments_iter, info = model.transcribe(str(audio_path), language=language, vad_filter=True)
+    segments_iter, info = model.transcribe(audio_array, language=language, vad_filter=True)
 
     segments = []
     full_text_parts = []
@@ -121,7 +147,7 @@ def main():
 
         print(f"Transcribing with Whisper model '{args.model}' (this can take a while on CPU)...", file=sys.stderr)
         try:
-            transcript = transcribe(audio_path, args.model, args.language)
+            transcript = transcribe(audio_path, workdir, args.model, args.language)
         except Exception as e:
             print(json.dumps({"error": f"failed to transcribe: {e}", "metadata": metadata}, ensure_ascii=False))
             sys.exit(1)
