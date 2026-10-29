@@ -18,39 +18,15 @@ import tempfile
 from pathlib import Path
 
 
-def fetch_metadata(url: str, cookies: str | None, cookies_from_browser: str | None) -> dict:
-    import yt_dlp
+def fetch_and_download(
+    url: str, workdir: Path, cookies: str | None, cookies_from_browser: str | None
+) -> tuple[dict, Path]:
+    """Single yt-dlp pass: extracts metadata and downloads+extracts audio.
 
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-    }
-    if cookies:
-        opts["cookiefile"] = cookies
-    if cookies_from_browser:
-        opts["cookiesfrombrowser"] = (cookies_from_browser,)
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    return {
-        "url": url,
-        "extractor": info.get("extractor"),
-        "title": info.get("title"),
-        "caption": info.get("description"),
-        "uploader": info.get("uploader") or info.get("channel"),
-        "upload_date": info.get("upload_date"),
-        "duration_seconds": info.get("duration"),
-        "view_count": info.get("view_count"),
-        "like_count": info.get("like_count"),
-        "comment_count": info.get("comment_count"),
-        "repost_count": info.get("repost_count"),
-        "hashtags": info.get("tags") or info.get("categories"),
-    }
-
-
-def download_audio(url: str, workdir: Path, cookies: str | None, cookies_from_browser: str | None) -> Path:
+    Doing this as one request (instead of a metadata-only call followed by a
+    separate download call) avoids tripping platforms' rate limits, which
+    trigger on two requests for the same URL in quick succession.
+    """
     import yt_dlp
 
     out_template = str(workdir / "audio.%(ext)s")
@@ -73,12 +49,27 @@ def download_audio(url: str, workdir: Path, cookies: str | None, cookies_from_br
         opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
+        info = ydl.extract_info(url, download=True)
+
+    metadata = {
+        "url": url,
+        "extractor": info.get("extractor"),
+        "title": info.get("title"),
+        "caption": info.get("description"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "upload_date": info.get("upload_date"),
+        "duration_seconds": info.get("duration"),
+        "view_count": info.get("view_count"),
+        "like_count": info.get("like_count"),
+        "comment_count": info.get("comment_count"),
+        "repost_count": info.get("repost_count"),
+        "hashtags": info.get("tags") or info.get("categories"),
+    }
 
     audio_files = list(workdir.glob("audio.*"))
     if not audio_files:
         raise RuntimeError("yt-dlp finished but no audio file was produced")
-    return audio_files[0]
+    return metadata, audio_files[0]
 
 
 def transcribe(audio_path: Path, model_size: str, language: str | None) -> dict:
@@ -116,18 +107,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix="video_analyze_") as tmp:
         workdir = Path(tmp)
 
-        print("Fetching metadata...", file=sys.stderr)
+        print("Fetching metadata and downloading audio...", file=sys.stderr)
         try:
-            metadata = fetch_metadata(args.url, args.cookies, args.cookies_from_browser)
+            metadata, audio_path = fetch_and_download(args.url, workdir, args.cookies, args.cookies_from_browser)
         except Exception as e:
-            print(json.dumps({"error": f"failed to fetch metadata: {e}"}, ensure_ascii=False))
-            sys.exit(1)
-
-        print("Downloading audio...", file=sys.stderr)
-        try:
-            audio_path = download_audio(args.url, workdir, args.cookies, args.cookies_from_browser)
-        except Exception as e:
-            print(json.dumps({"error": f"failed to download audio: {e}", "metadata": metadata}, ensure_ascii=False))
+            print(json.dumps({"error": f"failed to fetch/download: {e}"}, ensure_ascii=False))
             sys.exit(1)
 
         if args.keep_media:
